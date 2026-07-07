@@ -188,6 +188,7 @@
   .card.status-optimo{ border-left-color: var(--moss-bright); }
   .card.status-alerta{ border-left-color: var(--gold); }
   .card.status-critico{ border-left-color: var(--danger); }
+  .card.nivel{ border-left-color: var(--gold); }
 
   .card .label{
     font-family:'Open Sans', sans-serif; font-weight: 700; font-size: 12px;
@@ -198,6 +199,14 @@
   .card .label .dot{ width:8px; height:8px; border-radius:50%; }
   .card.turbidez .label .dot{ background: var(--teal); }
   .card.salinidad .label .dot{ background: var(--violet); }
+  .card.nivel .label .dot{ background: var(--gold); }
+
+  .badge-sim{
+    font-size: 9px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase;
+    padding: 2px 8px; border-radius: 999px; margin-left: 6px;
+    background: rgba(217,167,92,0.18); color: var(--gold);
+    border: 1px solid rgba(217,167,92,0.35);
+  }
 
   .status-badge{
     margin-left:auto;
@@ -215,6 +224,7 @@
   }
   .card.turbidez .value{ color: var(--teal); }
   .card.salinidad .value{ color: var(--violet); }
+  .card.nivel .value{ color: var(--gold); }
   .card .unit{
     font-family:'Open Sans', sans-serif; font-size: 15px;
     color: rgba(233,245,242,0.65); font-weight: 500;
@@ -315,6 +325,15 @@
       <div class="value"><span id="val-salinidad">--</span><span class="unit">ppm aprox.</span></div>
       <div class="read" id="read-salinidad">Sin datos aún</div>
     </div>
+    <div class="card nivel" id="card-nivel">
+      <div class="label">
+        <span class="dot"></span>Nivel de Agua
+        <span class="info-ico" tabindex="0">i<span class="tip">Distancia del sensor a la superficie del agua en la cámara de muestreo. Baja mientras la bomba llena, sube mientras drena.</span></span>
+        <span class="badge-sim">Simulado</span>
+      </div>
+      <div class="value"><span id="val-nivel">--</span><span class="unit">cm</span></div>
+      <div class="read" id="read-nivel">Sin datos aún · <span id="fase-bomba-text">bomba: --</span></div>
+    </div>
   </div>
 
   <div class="report">
@@ -346,13 +365,24 @@
     <canvas id="chartSalinidad"></canvas>
   </div>
 
+  <div class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Historial · Nivel de Agua (simulado)</h2>
+        <p class="sub">coordinado con el ciclo de la bomba · lecturas de la sesión actual</p>
+      </div>
+    </div>
+    <div class="range-select" data-chart-range></div>
+    <canvas id="chartNivel"></canvas>
+  </div>
+
   <footer>humedal-monitor-default-rtdb.firebaseio.com · actualiza cada 5s</footer>
 </div>
 
 <script>
 // ==================== CONFIGURACIÓN ====================
 const DATABASE_URL = "https://humedal-monitor-default-rtdb.firebaseio.com";
-const DB_PATH = ""; // pon "lecturas" (o el nombre que uses) si tus datos NO están en la raíz
+const DB_PATH = "lecturas"; // los datos de turbidez/salinidad viven bajo /lecturas, no en la raíz
 const POLL_MS = 5000;
 const MAX_SERVER_POINTS = 30;   // cuántas lecturas traer de Firebase por consulta
 const MAX_BUFFER_POINTS = 400;  // cuántas lecturas acumular en memoria durante la sesión
@@ -368,7 +398,8 @@ const THRESHOLDS = {
 // Rango sugerido de los ejes Y (no recorta datos reales, solo da una escala inicial sensata)
 const AXIS_SUGGESTED = {
   turbidez:  { min: 0, max: 100 },
-  salinidad: { min: 0, max: 1500 }
+  salinidad: { min: 0, max: 1500 },
+  nivel:     { min: 0, max: 35 }
 };
 // =========================================================
 
@@ -464,6 +495,7 @@ function makeChartConfig(color, suggested){
 
 const chartTurbidez = new Chart(document.getElementById('chartTurbidez'), makeChartConfig('#2FB8C6', AXIS_SUGGESTED.turbidez));
 const chartSalinidad = new Chart(document.getElementById('chartSalinidad'), makeChartConfig('#8B7CF0', AXIS_SUGGESTED.salinidad));
+const chartNivel = new Chart(document.getElementById('chartNivel'), makeChartConfig('#D9A75C', AXIS_SUGGESTED.nivel));
 
 // ---------- Selector de rango (por ventana de tiempo de sesión, no depende del backend) ----------
 const RANGES = [
@@ -485,6 +517,7 @@ function renderRangeButtons(){
         activeRangeId = r.id;
         renderRangeButtons();
         renderCharts();
+        renderChartNivel();
       });
       container.appendChild(btn);
     });
@@ -495,6 +528,10 @@ renderRangeButtons();
 // ---------- Buffer de sesión (acumula lecturas mientras la pestaña sigue abierta) ----------
 let buffer = []; // { key, turbidez, salinidad, receivedAt, timestamp }
 const seenKeys = new Set();
+
+// ---------- Buffer separado para el nivel (nodo /nivel.json, independiente de /lecturas) ----------
+let bufferNivel = []; // { key, nivel_cm, fase_bomba, receivedAt, timestamp }
+const seenKeysNivel = new Set();
 
 function buildUrl(){
   const path = DB_PATH ? `/${DB_PATH}.json` : `/.json`;
@@ -583,6 +620,79 @@ function selectedSlice(){
   return buffer; // toda la sesión
 }
 
+function selectedSliceNivel(){
+  const range = RANGES.find(r => r.id === activeRangeId);
+  if(range.count){
+    return bufferNivel.slice(-range.count);
+  }
+  if(range.windowMs){
+    const cutoff = Date.now() - range.windowMs;
+    return bufferNivel.filter(e => e.receivedAt >= cutoff);
+  }
+  return bufferNivel; // toda la sesión
+}
+
+// ---------- Nivel de agua (simulado) - nodo /nivel.json ----------
+function buildUrlNivel(){
+  return `${DATABASE_URL}/nivel.json`;
+}
+
+async function fetchNivel(){
+  try{
+    const res = await fetch(buildUrlNivel(), { cache: 'no-store' });
+    if(!res.ok) return; // errores de nivel no bloquean el resto del dashboard
+    const data = await res.json();
+    if(!data) return; // aún no hay lecturas de nivel
+    ingestNivel(data);
+  }catch(e){
+    // silencioso: el nivel es un dato secundario/simulado, no debe tapar errores del resto
+  }
+}
+
+function ingestNivel(data){
+  const entries = Object.entries(data)
+    .filter(([k, v]) => v && typeof v === 'object')
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .slice(-MAX_SERVER_POINTS);
+
+  if(entries.length === 0) return;
+
+  const now = Date.now();
+  entries.forEach(([k, v]) => {
+    if(seenKeysNivel.has(k)) return;
+    seenKeysNivel.add(k);
+    bufferNivel.push({
+      key: k,
+      nivel_cm: v.nivel_cm,
+      fase_bomba: v.fase_bomba,
+      timestamp: v.timestamp !== undefined ? Number(v.timestamp) : null,
+      receivedAt: now
+    });
+  });
+  if(bufferNivel.length > MAX_BUFFER_POINTS){
+    bufferNivel = bufferNivel.slice(-MAX_BUFFER_POINTS);
+  }
+
+  const last = entries[entries.length - 1][1];
+  document.getElementById('val-nivel').textContent =
+    (last.nivel_cm !== undefined) ? Number(last.nivel_cm).toFixed(1) : '--';
+
+  const timeStr = new Date(now).toLocaleTimeString('es-CL', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  const faseTexto = last.fase_bomba ? last.fase_bomba : '--';
+  document.getElementById('read-nivel').innerHTML =
+    'Última lectura recibida: ' + timeStr + ' · <span id="fase-bomba-text">bomba: ' + faseTexto + '</span>';
+
+  renderChartNivel();
+}
+
+function renderChartNivel(){
+  const slice = selectedSliceNivel();
+  const labels = slice.map(labelFor);
+  chartNivel.data.labels = labels;
+  chartNivel.data.datasets[0].data = slice.map(e => e.nivel_cm !== undefined ? e.nivel_cm : null);
+  chartNivel.update();
+}
+
 function labelFor(entry){
   if(entry.timestamp){
     return new Date(entry.timestamp).toLocaleTimeString('es-CL', {hour:'2-digit', minute:'2-digit'});
@@ -604,7 +714,9 @@ function renderCharts(){
 }
 
 fetchData();
+fetchNivel();
 setInterval(fetchData, POLL_MS);
+setInterval(fetchNivel, POLL_MS);
 </script>
 </body>
 </html>
